@@ -3,7 +3,9 @@ declare(strict_types=1);
 
 require __DIR__ . '/FileDetector.php';
 
+/** @var string[] */
 $FailingTests = [];
+/** @var array<string, array<string, string|string[]>>|false */
 $Rulesets = parse_ini_file( __DIR__ . '/../rules.ini', true, INI_SCANNER_RAW );
 $AllowedNameCharacters = '/^[a-zA-Z0-9_-]+$/';
 
@@ -43,6 +45,13 @@ foreach( $Rulesets as $Type => $Rules )
 			{
 				$FailingTests[] = "$Type.$Name: Regex \"$Regex\" contains a capturing group";
 			}
+
+			$RegexIssue = CheckRegexPerformance( $Regex );
+
+			if( $RegexIssue !== null )
+			{
+				$FailingTests[] = "$Type.$Name: Regex \"$Regex\" $RegexIssue";
+			}
 		}
 	}
 }
@@ -50,6 +59,7 @@ foreach( $Rulesets as $Type => $Rules )
 $Detector = new FileDetector( $Rulesets, null );
 $Detector->FilterEvidenceMatches = false;
 
+/** @var array<string, bool> */
 $SeenTestTypes = [];
 
 TestBasicRules( $Detector, $SeenTestTypes, $FailingTests );
@@ -59,9 +69,15 @@ TestExtra( $Detector, $FailingTests );
 
 // Really basic code to find extra detections that aren't specified in rules.ini
 $Code = file_get_contents( __DIR__ . '/FileDetector.php' );
+
+if( $Code === false )
+{
+	throw new \RuntimeException( 'Failed to read FileDetector.php' );
+}
+
 preg_match_all( '/[\'"](?<string>(?:' . implode( '|', array_keys( $Rulesets ) ) . ')\.\w+)[\'"]/', $Code, $Matches );
 
-$AllFoundTestTypes = array_unique( array_merge( $Detector->Map, $Matches[ 'string' ] ) );
+$AllFoundTestTypes = array_unique( array_merge( $Detector->Map, $Matches[ 'string' ] ?? [] ) );
 
 foreach( $AllFoundTestTypes as $TestType )
 {
@@ -83,6 +99,11 @@ foreach( $AllFoundTestTypes as $TestType )
 	}
 
 	$Text = file_get_contents( $File );
+
+	if( $Text === false )
+	{
+		throw new \RuntimeException( 'Failed to read ' .  $File );
+	}
 
 	if( str_contains( $Text, 'steamdb.info' ) )
 	{
@@ -133,6 +154,89 @@ function RegexHasCapturingGroups( string $regex ) : bool
 	);
 }
 
+function CheckRegexPerformance( string $regex ) : ?string
+{
+	// Check for .+ or .*, skip if it's inside a character class like [.+]
+	if( preg_match( '/(?<!\[)\.[\+\*]/', $regex ) )
+	{
+		return 'uses .+ or .* which is inefficient';
+	}
+
+	// Patterns like (.+)+ or (a*)*
+	if( preg_match( '/\([^)]*[\+\*][^)]*\)[\+\*]/', $regex ) )
+	{
+		return 'has nested quantifiers';
+	}
+
+	// Quantifier applied to anchor
+	if( preg_match( '/[\^\$][\+\*\?]/', $regex ) )
+	{
+		return 'has quantifier on anchor';
+	}
+
+	// Empty alternation like (|foo) or (foo|)
+	if( preg_match( '/\(\||\|\)/', $regex ) )
+	{
+		return 'has empty alternation';
+	}
+
+	// Check for quantifiers that should be possessive:
+	// \w+, \d+, [a-z]+, etc. followed by \. should use possessive quantifier
+	// Only flag variable quantifiers (+, *, {n,m}), not fixed like {16}
+	// Pattern: (\w or \d or \W or \D or [...]) followed by (+, *, {n,m}) NOT followed by + (possessive), then \.
+	if( preg_match( '/(?:\\\\[wdWD]|\\[[^\\]]+\\])(?:[+*]|\\{\\d+,\\d*\\})(?!\\+)\\\\\\./', $regex ) )
+	{
+		return 'has quantifier that should be possessive (add + after quantifier, e.g. \\w++ instead of \\w+)';
+	}
+
+	// Check for alternation ordering issues in non-atomic groups
+	// If a shorter alternative comes before a longer one that starts with it,
+	// the shorter one will match first and prevent the longer from matching (in atomic)
+	// or cause unnecessary backtracking (in non-atomic)
+	if( preg_match_all( '/\\(\\?(?!>)[:!<>=]?([^)]+)\\)|\\(([^?)][^)]*)\\)/', $regex, $groupMatches ) )
+	{
+		$groups = array_filter( array_merge( $groupMatches[1], $groupMatches[2] ) );
+
+		foreach( $groups as $group )
+		{
+			$alternatives = explode( '|', $group );
+			$count = count( $alternatives );
+
+			if( $count > 1 )
+			{
+				for( $i = 0; $i < $count; $i++ )
+				{
+					for( $j = $i + 1; $j < $count; $j++ )
+					{
+						// Skip empty alternatives (intentional for "optional" semantics)
+						if( $alternatives[$i] === '' )
+						{
+							continue;
+						}
+
+						// Skip if either contains regex metacharacters that complicate prefix checking
+						if( preg_match( '/[?*+\\[\\]\\\\]/', $alternatives[$i] ) )
+						{
+							continue;
+						}
+
+						// Check if alternative i is a literal prefix of alternative j
+						if( str_starts_with( $alternatives[$j], $alternatives[$i] ) && $alternatives[$i] !== $alternatives[$j] )
+						{
+							return "alternation order: '{$alternatives[$i]}' before '{$alternatives[$j]}' (put longer first or use atomic group)";
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return null;
+}
+
+/**
+ * @param array<string, string|string[]> $Rulesets
+ */
 function TestSorting( array $Rulesets ) : ?string
 {
 	$Sorted = $Rulesets;
@@ -152,8 +256,14 @@ function TestSorting( array $Rulesets ) : ?string
 				continue;
 			}
 
-			$sortedPosition = array_search( $gamesKeys[ $i ], $gamesSortedKeys );
-			$actualPosition = array_search( $gamesSortedKeys[ $i ], $gamesKeys );
+			$sortedPosition = array_search( $gamesKeys[ $i ], $gamesSortedKeys, true );
+			$actualPosition = array_search( $gamesSortedKeys[ $i ], $gamesKeys, true );
+
+			if( $sortedPosition === false || $actualPosition === false )
+			{
+				return "Failed to find position of \"{$gamesKeys[ $i ]}\" in sorted array";
+			}
+
 			$shouldBe = $gamesSortedKeys[ $sortedPosition - 1 ];
 
 			if( $actualPosition > $sortedPosition )
@@ -168,6 +278,10 @@ function TestSorting( array $Rulesets ) : ?string
 	return null;
 }
 
+/**
+ * @param array<string, bool> $SeenTestTypes
+ * @param string[] $FailingTests
+ */
 function TestDescriptions( array $SeenTestTypes, array &$FailingTests ) : void
 {
 	$TestsIterator = new DirectoryIterator( __DIR__ . '/../descriptions' );
@@ -192,6 +306,10 @@ function TestDescriptions( array $SeenTestTypes, array &$FailingTests ) : void
 	}
 }
 
+/**
+ * @param array<string, bool> $SeenTestTypes
+ * @param string[] $FailingTests
+ */
 function TestBasicRules( FileDetector $Detector, array &$SeenTestTypes, array &$FailingTests ) : void
 {
 	$TestsIterator = new DirectoryIterator( __DIR__ . '/types' );
@@ -212,6 +330,11 @@ function TestBasicRules( FileDetector $Detector, array &$SeenTestTypes, array &$
 		$TestFilePaths = file( $File->getPathname(), FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
 		$ExpectedType = $File->getBasename( '.txt' );
 
+		if( $TestFilePaths === false )
+		{
+			throw new \RuntimeException( "Failed to read file: types/{$File->getFilename()}" );
+		}
+
 		if( empty( $TestFilePaths ) )
 		{
 			$FailingTests[] = "File is empty: types/{$File->getFilename()}";
@@ -227,6 +350,7 @@ function TestBasicRules( FileDetector $Detector, array &$SeenTestTypes, array &$
 			$ExpectedType = null;
 		}
 
+		/** @var array<string, bool> */
 		$AlreadySeenStrings = [];
 
 		foreach( $TestFilePaths as $Path )
@@ -280,6 +404,10 @@ function TestBasicRules( FileDetector $Detector, array &$SeenTestTypes, array &$
 	}
 }
 
+/**
+ * @param array<string, bool> $SeenTestTypes
+ * @param string[] $FailingTests
+ */
 function TestFilelists( FileDetector $Detector, array &$SeenTestTypes, array &$FailingTests ) : void
 {
 	$TestsIterator = new DirectoryIterator( __DIR__ . '/filelists' );
@@ -301,6 +429,11 @@ function TestFilelists( FileDetector $Detector, array &$SeenTestTypes, array &$F
 		$BaseName = $File->getBasename( '.txt' );
 		$Bits = explode( '.', $BaseName, 3 );
 		$ExpectedType = $Bits[ 0 ] . '.' . $Bits[ 1 ];
+
+		if( $TestFilePaths === false )
+		{
+			throw new \RuntimeException( "Failed to read file: filelists/{$File->getFilename()}" );
+		}
 
 		if( empty( $TestFilePaths ) )
 		{
@@ -330,6 +463,9 @@ function TestFilelists( FileDetector $Detector, array &$SeenTestTypes, array &$F
 	}
 }
 
+/**
+ * @param string[] $FailingTests
+ */
 function TestExtra( FileDetector $Detector, array &$FailingTests ) : void
 {
 	$GodotTests =

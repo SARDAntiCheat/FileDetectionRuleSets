@@ -1,4 +1,7 @@
 /anybrainSDK.dll
-anybrainSDK.dll
-Sub/anybrainSDK.dll
+/Cerebro.dll
 Sub/AnyBrain/anybrainSDK.dll
+Sub/anybrainSDK.dll
+Sub/Cerebro.dll
+anybrainSDK.dll
+Cerebro.dll
